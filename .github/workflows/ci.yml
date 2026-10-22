@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: lint, types, unit and integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.25"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync frozen environment
+        run: uv sync --frozen
+
+      - name: Ruff lint
+        run: uv run --frozen ruff check .
+
+      - name: Ruff format check
+        run: uv run --frozen ruff format --check .
+
+      - name: Mypy
+        run: uv run --frozen mypy
+
+      - name: Unit tests
+        run: uv run --frozen pytest tests/unit -q
+
+      - name: Create demo environment when absent
+        run: test -f .env || cp .env.example .env
+
+      - name: Build runtime and test images
+        run: docker compose --profile test build
+
+      - name: Start test dependencies and application services
+        run: docker compose --profile test up -d --wait --wait-timeout 180 postgres rabbitmq webhook api consumer
+
+      - name: Verify API and consumer readiness
+        run: |
+          set -euo pipefail
+          docker compose ps --status running --services | tee /tmp/running-services
+          grep -qx api /tmp/running-services
+          grep -qx consumer /tmp/running-services
+          test "$(docker compose ps --format '{{.Health}}' api)" = "healthy"
+          for attempt in $(seq 1 30); do
+            queues="$(docker compose exec -T rabbitmq rabbitmqctl -q list_queues name 2>/dev/null || true)"
+            if grep -Fxq payments.new <<<"$queues" && grep -Fxq payments.dlq <<<"$queues"; then
+              echo "consumer declared the required queues"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "consumer did not declare the required queues" >&2
+          docker compose logs consumer
+          exit 1
+
+      - name: Integration tests
+        run: docker compose --profile test run --rm --no-TTY tests uv run --frozen pytest tests/integration -q
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose --profile test logs --no-color --tail 200
+
+      - name: Stop CI resources
+        if: always()
+        run: docker compose --profile test down --remove-orphans

@@ -1,0 +1,103 @@
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  env_file: .env
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Prepare .env from .env.example}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Prepare .env from .env.example}
+      POSTGRES_DB: ${POSTGRES_DB:?Prepare .env from .env.example}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Prepare .env from .env.example}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Prepare .env from .env.example}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  api:
+    <<: *app
+    command: ["sh", "-c", "uv run --no-sync alembic upgrade head && exec uv run --no-sync uvicorn payment_resolver.app:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log --log-level warning"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "--no-sync", "python", "-c", "import socket; socket.create_connection(('127.0.0.1',8000),2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  consumer:
+    <<: *app
+    command: ["uv", "run", "--no-sync", "python", "-m", "payment_resolver.consumer"]
+    restart: unless-stopped
+    stop_grace_period: 35s
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  webhook:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    command: ["uv", "run", "--no-sync", "uvicorn", "tests.support.webhook_receiver:app", "--host", "0.0.0.0", "--port", "8081"]
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "uv", "run", "--no-sync", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/receipts')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      TEST_POSTGRES_ADMIN_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/postgres
+      TEST_RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      TEST_RABBITMQ_USERNAME: ${RABBITMQ_DEFAULT_USER}
+      TEST_RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS}
+      TEST_WEBHOOK_URL: http://webhook:8081
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      webhook:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
